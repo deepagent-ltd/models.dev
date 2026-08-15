@@ -1,0 +1,54 @@
+name: sync-models-catalog
+
+on:
+  schedule:
+    # 每小时第 10 分钟同步一次(models.dev 自身每小时更新)
+    - cron: "10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch models.dev api.json (retry x3)
+        run: |
+          set -u
+          ok=""
+          for i in 1 2 3; do
+            if curl -fsSL --max-time 60 https://models.dev/api.json -o api.json.new; then
+              ok=1
+              break
+            fi
+            echo "fetch attempt $i failed" >&2
+            sleep 10
+          done
+          if [ -z "${ok:-}" ]; then
+            echo "models.dev unreachable after 3 attempts" >&2
+            exit 1
+          fi
+
+      - name: Validate catalog structure
+        run: node .github/scripts/validate-catalog.mjs api.json.new
+
+      - name: Commit when changed
+        run: |
+          new_sha=$(sha256sum api.json.new | cut -d" " -f1)
+          old_sha=$(sha256sum api.json 2>/dev/null | cut -d" " -f1 || true)
+          if [ "$new_sha" = "$old_sha" ]; then
+            echo "Catalog unchanged ($new_sha); skipping commit."
+            rm api.json.new
+            exit 0
+          fi
+          mv api.json.new api.json
+          printf '%s\n' "$new_sha" > SHA256
+          git config user.name "deepagent-ltd-bot"
+          git config user.email "deepagent-ltd-bot@users.noreply.github.com"
+          git add api.json SHA256
+          git commit -m "chore: sync models.dev catalog $(date -u +%Y-%m-%dT%H:%M:%SZ) sha256:${new_sha:0:12}"
+          git push
